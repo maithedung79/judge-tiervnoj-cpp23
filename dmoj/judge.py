@@ -1,8 +1,10 @@
 #!/usr/bin/python
 import logging
+import copy
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -15,7 +17,9 @@ from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, S
 
 from dmoj import packet
 from dmoj.control import JudgeControlRequestHandler
-from dmoj.error import CompileError
+from dmoj.cptbox.utils import MemoryIO
+from dmoj.error import CompileError, OutputLimitExceeded
+from dmoj.graders.standard import StandardGrader
 from dmoj.judgeenv import env, get_supported_problems_and_mtimes, startup_warnings
 from dmoj.monitor import Monitor
 from dmoj.problem import BaseTestCase, BatchedTestCase, Problem, TestCase
@@ -43,6 +47,7 @@ class IPC(Enum):
     GRADING_BEGIN = 'GRADING-BEGIN'
     GRADING_END = 'GRADING-END'
     GRADING_ABORTED = 'GRADING-ABORTED'
+    INVOCATION_RESULT = 'INVOCATION-RESULT'
     UNHANDLED_EXCEPTION = 'UNHANDLED-EXCEPTION'
     REQUEST_ABORT = 'REQUEST-ABORT'
 
@@ -51,6 +56,8 @@ class IPC(Enum):
 # (Otherwise, aborting during a compilation that exceeds this time limit would result in a `TimeoutError` IE instead of
 # a `CompileError`.)
 IPC_TIMEOUT = 60  # seconds
+CUSTOM_INVOCATION_OUTPUT_LIMIT = 512 * 1024
+CUSTOM_INVOCATION_ERROR_LIMIT = 256 * 1024
 
 
 logger = logging.getLogger(__name__)
@@ -71,11 +78,26 @@ Submission = NamedTuple(
     ],
 )
 
+Invocation = NamedTuple(
+    'Invocation',
+    [
+        ('id', str),
+        ('problem_id', str),
+        ('storage_namespace', Optional[str]),
+        ('language', str),
+        ('source', str),
+        ('input_data', str),
+        ('time_limit', float),
+        ('memory_limit', int),
+    ],
+)
+
 
 class Judge:
     def __init__(self, packet_manager: packet.PacketManager) -> None:
         self.packet_manager = packet_manager
         self.current_judge_worker: Optional[JudgeWorker] = None
+        self.current_invocation_worker: Optional[InvocationWorker] = None
         self._grading_lock = threading.Lock()
 
         self.updater_exit = False
@@ -86,6 +108,11 @@ class Judge:
     def current_submission(self):
         worker = self.current_judge_worker
         return worker.submission if worker else None
+
+    @property
+    def current_invocation(self):
+        worker = self.current_invocation_worker
+        return worker.invocation if worker else None
 
     def _updater_thread(self) -> None:
         log = logging.getLogger('dmoj.updater')
@@ -125,7 +152,7 @@ class Judge:
         # have finished tearing down. Trashing global state (e.g. `self.current_judge_worker`) before then would be
         # an error.
         self._grading_lock.acquire()
-        assert self.current_judge_worker is None
+        assert self.current_judge_worker is None and self.current_invocation_worker is None
 
         report(
             ansi_style(
@@ -148,6 +175,30 @@ class Judge:
 
         if blocking:
             grading_thread.join()
+
+    def begin_custom_invocation(self, invocation: Invocation, report=logger.info, blocking=False) -> None:
+        self._grading_lock.acquire()
+        assert self.current_judge_worker is None and self.current_invocation_worker is None
+
+        report(
+            ansi_style(
+                'Start custom invocation #ansi[%s](yellow)/#ansi[%s](green|bold) in %s...'
+                % (invocation.problem_id, invocation.id, invocation.language)
+            )
+        )
+
+        self.current_invocation_worker = InvocationWorker(invocation)
+
+        ipc_ready_signal = threading.Event()
+        invocation_thread = threading.Thread(
+            target=self._invocation_thread_main, args=(ipc_ready_signal, report), daemon=True
+        )
+        invocation_thread.start()
+
+        ipc_ready_signal.wait()
+
+        if blocking:
+            invocation_thread.join()
 
     def _grading_thread_main(self, ipc_ready_signal: threading.Event, report) -> None:
         assert self.current_judge_worker is not None
@@ -192,6 +243,45 @@ class Judge:
             # other side from waiting forever.
             ipc_ready_signal.set()
 
+            self._grading_lock.release()
+
+    def _invocation_thread_main(self, ipc_ready_signal: threading.Event, report) -> None:
+        assert self.current_invocation_worker is not None
+
+        try:
+            ipc_handler_dispatch: Dict[IPC, Callable] = {
+                IPC.HELLO: lambda _report: ipc_ready_signal.set(),
+                IPC.INVOCATION_RESULT: self._ipc_invocation_result,
+                IPC.UNHANDLED_EXCEPTION: self._ipc_invocation_unhandled_exception,
+            }
+
+            for ipc_type, data in self.current_invocation_worker.communicate():
+                try:
+                    handler_func = ipc_handler_dispatch[ipc_type]
+                except KeyError:
+                    raise RuntimeError(
+                        'judge got unexpected IPC message from invocation worker: %s' % ((ipc_type, data),)
+                    ) from None
+
+                handler_func(report, *data)
+
+            report(
+                ansi_style(
+                    'Done custom invocation #ansi[%s](yellow)/#ansi[%s](green|bold).\n'
+                    % (self.current_invocation.problem_id, self.current_invocation.id)
+                )
+            )
+        except Exception:
+            logger.exception('Custom invocation crashed before a result could be reported.')
+            if self.current_invocation is not None:
+                self.packet_manager.custom_invocation_result_packet(
+                    self.current_invocation.id,
+                    {'status': 'IE', 'error': 'Unhandled judge error while running the custom invocation.'},
+                )
+        finally:
+            self.current_invocation_worker.wait_with_timeout()
+            self.current_invocation_worker = None
+            ipc_ready_signal.set()
             self._grading_lock.release()
 
     def _ipc_compile_error(self, report, error_message: str) -> None:
@@ -246,6 +336,18 @@ class Judge:
         logger.error('Unhandled exception in worker process')
         self.log_internal_error(message=message)
 
+    def _ipc_invocation_result(self, _report, result: dict) -> None:
+        assert self.current_invocation is not None
+        self.packet_manager.custom_invocation_result_packet(self.current_invocation.id, result)
+
+    def _ipc_invocation_unhandled_exception(self, _report, message: str) -> None:
+        logger.error('Unhandled exception in invocation worker process')
+        if self.current_invocation is not None:
+            self.packet_manager.custom_invocation_result_packet(
+                self.current_invocation.id,
+                {'status': 'IE', 'error': strip_ansi(message)},
+            )
+
     def abort_grading(self, submission_id: Optional[int] = None) -> None:
         # Capture locally so we don't end up with a TOCTOU NoneType error. This function is typically called
         # from the network thread, but `current_judge_worker` is updated from the grading thread.
@@ -277,6 +379,8 @@ class Judge:
         End any submission currently executing, and exit the judge.
         """
         self.abort_grading()
+        if self.current_invocation_worker is not None:
+            self.current_invocation_worker.wait_with_timeout()
         self.updater_exit = True
         self.updater_signal.set()
         if self.packet_manager:
@@ -310,6 +414,7 @@ class Judge:
 class JudgeWorker:
     def __init__(self, submission: Submission) -> None:
         self.submission = submission
+        self.runtime_config = copy.deepcopy(env.runtime.unwrap())
         self._abort_requested = False
         self._sent_sigkill_to_worker_process = False
         # FIXME(tbrindus): marked Any pending grader cleanups.
@@ -345,7 +450,11 @@ class JudgeWorker:
                 raise
 
             if ipc_type == IPC.BYE:
-                self.worker_process_conn.send((IPC.BYE, ()))
+                try:
+                    self.worker_process_conn.send((IPC.BYE, ()))
+                except (BrokenPipeError, OSError):
+                    # The worker child may exit immediately after reporting completion.
+                    pass
                 return
             else:
                 yield ipc_type, data
@@ -382,6 +491,22 @@ class JudgeWorker:
         """
         worker_process_conn.close()
         setproctitle(multiprocessing.current_process().name)
+
+        from dmoj import executors as executor_registry
+        from dmoj import judgeenv
+        from dmoj.executors.base_executor import BaseExecutor
+
+        if self.runtime_config:
+            BaseExecutor.runtime_dict.update(self.runtime_config)
+            judgeenv.env.runtime.update(self.runtime_config)
+
+        if self.submission.language not in executor_registry.executors:
+            try:
+                executor_registry.executors[self.submission.language] = executor_registry.load_executor(
+                    self.submission.language
+                )
+            except Exception:
+                logger.exception('Failed to load executor %s in worker process', self.submission.language)
 
         def _ipc_recv_thread_main() -> None:
             """
@@ -556,6 +681,292 @@ class JudgeWorker:
         self._abort_requested = True
         if self.grader:
             self.grader.abort_grading()
+
+
+class InvocationWorker:
+    def __init__(self, invocation: Invocation) -> None:
+        self.invocation = invocation
+        self.runtime_config = copy.deepcopy(env.runtime.unwrap())
+        self.worker_process_conn, child_conn = multiprocessing.Pipe()
+        self.worker_process = multiprocessing.Process(
+            name='DMOJ Invocation Handler for %s/%s' % (self.invocation.problem_id, self.invocation.id),
+            target=self._worker_process_main,
+            args=(child_conn, self.worker_process_conn),
+        )
+        self.worker_process.start()
+        child_conn.close()
+
+    def communicate(self) -> Generator[Tuple[IPC, tuple], None, None]:
+        recv_timeout = max(60, int(2 * self.invocation.time_limit))
+        while True:
+            try:
+                if not self.worker_process_conn.poll(timeout=recv_timeout):
+                    raise TimeoutError('worker did not send a message in %d seconds' % recv_timeout)
+
+                ipc_type, data = self.worker_process_conn.recv()
+            except TimeoutError:
+                logger.error(
+                    'Invocation worker has not sent a message in %d seconds, assuming dead and killing.',
+                    recv_timeout,
+                )
+                self.worker_process.kill()
+                raise
+            except EOFError:
+                raise
+            except Exception:
+                logger.error('Failed to read IPC message from invocation worker!')
+                raise
+
+            if ipc_type == IPC.BYE:
+                try:
+                    self.worker_process_conn.send((IPC.BYE, ()))
+                except (BrokenPipeError, OSError):
+                    # The invocation child may exit immediately after reporting the result.
+                    pass
+                return
+            else:
+                yield ipc_type, data
+
+    def wait_with_timeout(self) -> None:
+        if self.worker_process and self.worker_process.is_alive():
+            try:
+                self.worker_process.join(timeout=IPC_TIMEOUT)
+            except OSError:
+                logger.exception('Exception while waiting for invocation worker to shut down, ignoring...')
+            finally:
+                if self.worker_process.is_alive():
+                    logger.error('Invocation worker is still alive, sending SIGKILL!')
+                    self.worker_process.kill()
+
+    def _worker_process_main(
+        self,
+        judge_process_conn: 'multiprocessing.connection.Connection',
+        worker_process_conn: 'multiprocessing.connection.Connection',
+    ) -> None:
+        worker_process_conn.close()
+        setproctitle(multiprocessing.current_process().name)
+
+        def _report_unhandled_exception() -> None:
+            message = ''.join(traceback.format_exception(*sys.exc_info()))
+            judge_process_conn.send((IPC.UNHANDLED_EXCEPTION, (message,)))
+            judge_process_conn.send((IPC.BYE, ()))
+
+        try:
+            judge_process_conn.send((IPC.HELLO, ()))
+            result = self._run_invocation()
+            judge_process_conn.send((IPC.INVOCATION_RESULT, (result,)))
+            judge_process_conn.send((IPC.BYE, ()))
+        except BrokenPipeError:
+            raise
+        except:  # noqa: E722, we explicitly want to notify the parent of everything
+            _report_unhandled_exception()
+
+    def _unsupported_result(self, message: str) -> dict:
+        return {
+            'status': 'UNSUPPORTED',
+            'error': message,
+            'stdout': '',
+            'stderr': '',
+            'compile-message': '',
+            'compile-error': '',
+            'time': 0.0,
+            'memory': 0,
+            'runtime-version': '',
+        }
+
+    def _run_invocation(self) -> dict:
+        from dmoj.config import ConfigNode
+        from dmoj import executors as executor_registry
+        from dmoj import judgeenv
+        from dmoj.executors.base_executor import BaseExecutor
+
+        if self.runtime_config:
+            BaseExecutor.runtime_dict.update(self.runtime_config)
+            judgeenv.env.runtime.update(self.runtime_config)
+
+        if self.invocation.language not in executor_registry.executors:
+            try:
+                executor_registry.executors[self.invocation.language] = executor_registry.load_executor(
+                    self.invocation.language
+                )
+            except Exception:
+                return self._unsupported_result(
+                    'This judge could not load the requested language for browser custom input runs.',
+                )
+
+        problem = Problem(
+            self.invocation.problem_id,
+            self.invocation.time_limit,
+            self.invocation.memory_limit,
+            {},
+            storage_namespace=self.invocation.storage_namespace,
+        )
+        grader_class = problem.grader_class
+        if grader_class is not StandardGrader:
+            return self._unsupported_result('This problem does not support running custom input from the browser.')
+
+        compile_message = ''
+        executor = None
+        process = None
+        input_file = None
+        extra_stdout_reader = None
+        extra_stdout_writer = None
+        stdout = b''
+        stderr = b''
+
+        try:
+            try:
+                grader = grader_class(self, problem, self.invocation.language, utf8bytes(self.invocation.source))
+            except CompileError as compilation_error:
+                return {
+                    'status': 'CE',
+                    'stdout': '',
+                    'stderr': '',
+                    'compile-message': '',
+                    'compile-error': strip_ansi(compilation_error.message),
+                    'error': '',
+                    'time': 0.0,
+                    'memory': 0,
+                    'runtime-version': '',
+                }
+
+            executor = grader.binary
+            warning = getattr(executor, 'warning', None)
+            if warning is not None:
+                compile_message = strip_ansi(utf8text(warning, 'replace'))
+
+            file_io = problem.config.file_io
+            invocation_input = utf8bytes(self.invocation.input_data)
+            communicate_input = invocation_input
+            stdin = subprocess.PIPE
+            launch_file_io = file_io
+            launch_kwargs = {
+                'time': self.invocation.time_limit,
+                'memory': self.invocation.memory_limit,
+                'file_io': launch_file_io,
+                'symlinks': problem.config.symlinks,
+                'stdin': stdin,
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.PIPE,
+                'wall_time': problem.config.wall_time_factor * self.invocation.time_limit,
+            }
+
+            if file_io and isinstance(file_io.get('input'), str):
+                input_file = MemoryIO(prefill=invocation_input, seal=True)
+                input_path = os.path.abspath(os.path.join(executor._dir, file_io['input']))
+                if os.path.lexists(input_path):
+                    os.unlink(input_path)
+                os.symlink(input_file.to_path(), input_path)
+
+                path_case_fixes = list(launch_kwargs.get('path_case_fixes', []))
+                path_whitelist = list(launch_kwargs.get('path_whitelist', []))
+                path_case_fixes.append(input_path)
+                path_whitelist.append(input_path)
+                launch_kwargs['path_case_fixes'] = path_case_fixes
+                launch_kwargs['path_whitelist'] = path_whitelist
+
+                # Keep stdin wired as well so browser custom tests work even if the source
+                # does not explicitly freopen the judge-provided file names.
+                communicate_input = invocation_input
+                launch_file_io = ConfigNode({'output': file_io.get('output')}) if file_io else file_io
+                launch_kwargs['file_io'] = launch_file_io
+
+            if file_io and isinstance(file_io.get('output'), str):
+                extra_stdout_reader_fd, extra_stdout_writer = os.pipe()
+                extra_stdout_reader = os.fdopen(extra_stdout_reader_fd, 'rb')
+                launch_kwargs['stdout'] = extra_stdout_writer
+
+            output_limit = problem.config.output_limit_length or CUSTOM_INVOCATION_OUTPUT_LIMIT
+            output_limit = min(output_limit, CUSTOM_INVOCATION_OUTPUT_LIMIT)
+
+            process = executor.launch(**launch_kwargs)
+
+            if extra_stdout_writer is not None:
+                os.close(extra_stdout_writer)
+                extra_stdout_writer = None
+
+            try:
+                stdout, stderr = process.communicate(
+                    communicate_input,
+                    outlimit=output_limit,
+                    errlimit=CUSTOM_INVOCATION_ERROR_LIMIT,
+                )
+            except OutputLimitExceeded as exc:
+                stderr = utf8bytes(str(exc))
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            finally:
+                process.wait()
+
+            if extra_stdout_reader is not None:
+                extra_stdout = extra_stdout_reader.read(output_limit + 1)
+                if len(extra_stdout) > output_limit:
+                    stderr = (stderr + b'\n' if stderr else b'') + utf8bytes(
+                        'Custom invocation output exceeded the browser output limit.',
+                    )
+                    extra_stdout = extra_stdout[:output_limit]
+
+                if stdout and extra_stdout:
+                    stdout += b'\n' + extra_stdout
+                elif extra_stdout:
+                    stdout = extra_stdout
+
+            runtime_version = ', '.join(
+                f'{runtime} {".".join(map(str, version))}' for runtime, version in executor.get_runtime_versions()
+            )
+
+            if process.is_tle:
+                status = 'TLE'
+            elif process.is_mle:
+                status = 'MLE'
+            elif process.is_ole:
+                status = 'OLE'
+            elif process.is_rte:
+                status = 'RTE'
+            elif process.is_ir:
+                status = 'IR'
+            else:
+                status = 'OK'
+
+            return {
+                'status': status,
+                'stdout': utf8text(stdout, 'replace'),
+                'stderr': utf8text(stderr, 'replace'),
+                'compile-message': compile_message,
+                'compile-error': '',
+                'error': '',
+                'time': process.execution_time or 0.0,
+                'memory': process.max_memory or 0,
+                'runtime-version': runtime_version,
+            }
+        except Exception:
+            return {
+                'status': 'IE',
+                'stdout': '',
+                'stderr': '',
+                'compile-message': compile_message,
+                'compile-error': '',
+                'error': strip_ansi(''.join(traceback.format_exception(*sys.exc_info()))),
+                'time': 0.0,
+                'memory': 0,
+                'runtime-version': '',
+            }
+        finally:
+            if input_file is not None:
+                input_file.close()
+            if extra_stdout_reader is not None:
+                extra_stdout_reader.close()
+            if extra_stdout_writer is not None:
+                os.close(extra_stdout_writer)
+            if process is not None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            if executor is not None:
+                executor.cleanup()
 
 
 class ClassicJudge(Judge):

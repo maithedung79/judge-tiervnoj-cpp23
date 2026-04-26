@@ -43,9 +43,20 @@ def compile_with_auxiliary_files(
         with open(filename, 'rb') as f:
             sources[os.path.basename(filename)] = f.read()
 
+    def ensure_runtime(language: str, ignore_errors: bool = False) -> bool:
+        if language in executors.executors:
+            return True
+        try:
+            executors.executors[language] = executors.load_executor(language)
+        except Exception as exc:
+            if ignore_errors:
+                return False
+            raise IOError(f'could not load executor {language}') from exc
+        return True
+
     def find_runtime(*languages):
         for grader in languages:
-            if grader in executors.executors:
+            if ensure_runtime(grader, ignore_errors=True):
                 return grader
         return None
 
@@ -69,6 +80,7 @@ def compile_with_auxiliary_files(
     if not lang:
         raise IOError('could not find an appropriate executor')
 
+    ensure_runtime(lang)
     executor = executors.executors[lang].Executor
 
     kwargs = {

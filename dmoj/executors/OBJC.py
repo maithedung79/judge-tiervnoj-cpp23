@@ -27,10 +27,12 @@ int main (int argc, const char * argv[]) {
 """
 
     def get_flags(self) -> List[str]:
-        return self.runtime_dict['objc_flags'] + super().get_flags()
+        objc_flags = self.runtime_dict.get('objc_flags') or []
+        return objc_flags + super().get_flags()
 
     def get_ldflags(self) -> List[str]:
-        return self.runtime_dict['objc_ldflags'] + super().get_ldflags()
+        objc_ldflags = self.runtime_dict.get('objc_ldflags') or []
+        return objc_ldflags + super().get_ldflags()
 
     def get_fs(self) -> List[FilesystemAccessRule]:
         return super().get_fs() + [ExactFile('/proc/self/cmdline')]

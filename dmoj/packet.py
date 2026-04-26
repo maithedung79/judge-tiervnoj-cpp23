@@ -2,6 +2,7 @@ import errno
 import json
 import logging
 import os
+import subprocess
 import socket
 import ssl
 import struct
@@ -88,7 +89,7 @@ class PacketManager:
 
     def _connect(self):
         problems = get_supported_problems_and_mtimes()
-        versions = get_runtime_versions()
+        versions = self._get_runtime_versions_with_fallback()
 
         log.info('Opening connection to: [%s]:%s', self.host, self.port)
 
@@ -111,7 +112,101 @@ class PacketManager:
         log.info('Starting handshake with: [%s]:%s', self.host, self.port)
         self.input = self.conn.makefile('rb')
         self.handshake(problems, versions, self.name, self.key)
+        if versions:
+            self.executors_packet(versions)
         log.info('Judge "%s" online: [%s]:%s', self.name, self.host, self.port)
+
+    def _get_runtime_versions_with_fallback(self):
+        versions = get_runtime_versions()
+        if versions:
+            return versions
+
+        log.warning('Handshake runtime discovery returned no executors, retrying in-process fallback')
+
+        try:
+            from dmoj import executors as executor_registry
+            from dmoj import judgeenv
+
+            old_skip_self_test = judgeenv.skip_self_test
+            judgeenv.skip_self_test = True
+            executor_registry.load_executors()
+            versions = get_runtime_versions()
+        except Exception:
+            log.exception('Failed to recover runtime versions for handshake fallback')
+        else:
+            if versions:
+                log.info('Recovered %d executor(s) for handshake fallback', len(versions))
+        finally:
+            try:
+                judgeenv.skip_self_test = old_skip_self_test
+            except Exception:
+                pass
+
+        if versions:
+            return versions
+
+        log.warning('In-process fallback still returned no executors, retrying via subprocess')
+        versions = self._get_runtime_versions_via_subprocess()
+        if versions:
+            log.info('Recovered %d executor(s) for handshake via subprocess fallback', len(versions))
+        return versions
+
+    def _get_runtime_versions_via_subprocess(self):
+        argv = list(sys.argv)
+        if '--skip-self-test' not in argv:
+            argv.append('--skip-self-test')
+
+        script = '''
+import contextlib
+import io
+import json
+import sys
+
+sys.argv = %r
+
+from dmoj import judgeenv, executors
+
+sink = io.StringIO()
+with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+    judgeenv.load_env()
+    executors.load_executors()
+
+from dmoj.judgeenv import get_runtime_versions
+sys.stdout.write(json.dumps(get_runtime_versions(), separators=(",", ":")))
+''' % (argv,)
+
+        try:
+            result = subprocess.run(
+                [sys.executable, '-c', script],
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except Exception:
+            log.exception('Failed to spawn subprocess for runtime discovery fallback')
+            return {}
+
+        if result.returncode != 0:
+            log.warning(
+                'Runtime discovery subprocess failed with code %s: %s',
+                result.returncode,
+                (result.stderr or result.stdout).strip(),
+            )
+            return {}
+
+        payload = result.stdout.strip()
+        if not payload:
+            return {}
+
+        try:
+            return json.loads(payload)
+        except Exception:
+            log.exception('Failed to parse runtime discovery subprocess payload: %r', payload[:500])
+            return {}
 
     def _reconnect(self):
         log.warning('Attempting reconnection in %.0fs: [%s]:%s', self.fallback, self.host, self.port)
@@ -276,6 +371,29 @@ class PacketManager:
                 packet['language'],
                 packet['problem-id'],
             )
+        elif name == 'custom-invocation-request':
+            invocation_id = packet['invocation-id']
+            self.custom_invocation_acknowledged_packet(invocation_id)
+            from dmoj.judge import Invocation
+
+            self.judge.begin_custom_invocation(
+                Invocation(
+                    id=invocation_id,
+                    problem_id=packet['problem-id'],
+                    storage_namespace=packet.get('storage-namespace', None),
+                    language=packet['language'],
+                    source=packet['source'],
+                    input_data=packet.get('input', ''),
+                    time_limit=float(packet['time-limit']),
+                    memory_limit=int(packet['memory-limit']),
+                )
+            )
+            log.info(
+                'Accept custom invocation: %s: executor: %s, code: %s',
+                invocation_id,
+                packet['language'],
+                packet['problem-id'],
+            )
         elif name == 'terminate-submission':
             self.judge.abort_grading()
         elif name == 'disconnect':
@@ -303,6 +421,10 @@ class PacketManager:
     def supported_problems_packet(self, problems: List[Tuple[str, float]]):
         log.debug('Update problems')
         self._send_packet({'name': 'supported-problems', 'problems': problems})
+
+    def executors_packet(self, executors):
+        log.debug('Update executors')
+        self._send_packet({'name': 'executors', 'executors': executors})
 
     def test_case_status_packet(self, position: int, result: Result):
         log.debug(
@@ -377,3 +499,11 @@ class PacketManager:
 
     def submission_acknowledged_packet(self, sub_id: int):
         self._send_packet({'name': 'submission-acknowledged', 'submission-id': sub_id})
+
+    def custom_invocation_acknowledged_packet(self, invocation_id: str):
+        self._send_packet({'name': 'custom-invocation-acknowledged', 'invocation-id': invocation_id})
+
+    def custom_invocation_result_packet(self, invocation_id: str, result: dict):
+        packet = {'name': 'custom-invocation-result', 'invocation-id': invocation_id}
+        packet.update(result)
+        self._send_packet(packet)

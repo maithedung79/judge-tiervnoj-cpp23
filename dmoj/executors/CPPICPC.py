@@ -5,14 +5,18 @@ from dmoj.executors.c_like_executor import CPPExecutor, GCCMixin
 
 class Executor(GCCMixin, CPPExecutor):
     command = 'g++'
-    command_paths = ['g++-11', 'g++']
-    std = 'gnu++20'
+    command_paths = ['g++-15', 'g++']
+    std = 'gnu++23'
     test_program = """
+#include <expected>
 #include <iostream>
 
-#if __cplusplus == 202002
+#if __cplusplus >= 202302L
 int main() {
-    std::strong_ordering comparison = 1 <=> 2;
+    std::expected<int, int> value = 23;
+    if (!value || value.value() != 23) {
+        return 1;
+    }
     auto input = std::cin.rdbuf();
     std::cout << input;
     return 0;
@@ -24,7 +28,7 @@ int main() {
         return self.defines
 
     def get_flags(self) -> List[str]:
-        return ['-x', 'c++', '-g', '-O2', '-std=gnu++20', '-static']
+        return ['-x', 'c++', '-g', '-O2', '-std=gnu++23', '-static']
 
     def get_compile_args(self) -> List[str]:
         command = self.get_command()
