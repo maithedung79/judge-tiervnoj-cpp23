@@ -1,3 +1,6 @@
+> This fork is customized for ORE/VNOJ C++23 and custom input/output judging.
+> See [README_CPP23_CUSTOM.md](README_CPP23_CUSTOM.md) for the build and VPS judge setup guide.
+
 <h1 align="center">
   <img src="https://github.com/DMOJ/online-judge/blob/master/logo.png?raw=true" width="120px">
   <br>
