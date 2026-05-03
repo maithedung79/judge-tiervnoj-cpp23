@@ -29,7 +29,11 @@ env: ConfigNode = ConfigNode(
         'validator_compiler_time_limit': 30,  # 30 seconds
         'validator_time_limit': 20,  # 20 seconds
         'validator_memory_limit': 524288,  # 512mb of RAM
-        'compiler_time_limit': 10,  # Kill compiler after 10 seconds
+        # Modern C++ toolchains, especially GCC 15 with C++20/C++23 under the
+        # compiler sandbox, can legitimately take more than 10 seconds to build
+        # common <bits/stdc++.h> submissions on shared judge hosts. Keep this
+        # separate from problem time limits; it only bounds compilation.
+        'compiler_time_limit': 30,  # Kill compiler after 30 seconds
         'compiler_size_limit': 131072,  # Maximum allowable compiled file size, 128mb
         'compiler_output_character_limit': 65536,  # Number of characters allowed in compile output
         'compiled_binary_cache_dir': None,  # Location to store cached binaries, defaults to tempdir

@@ -8,6 +8,10 @@ This branch packages the ORE/VNOJ judge image used by `ojkhanhhoa.site`.
 - Adds a `CPP23` executor.
 - Updates `CPPICPC` from `gnu++20` to `gnu++23`.
 - Uses GCC/G++ 15 (`g++ 15.2.0` on the deployed image), which supports C++23 mode.
+- Sets the default judge compiler timeout to 30 seconds. This avoids false
+  compile-timeout verdicts from modern GCC 15 C++20/C++23 builds under the DMOJ
+  compiler sandbox; it does not change problem execution time limits.
+- Precompiles `bits/stdc++.h` for `gnu++23` in addition to the older C++ modes.
 - Builds the full image from this repository instead of downloading `master` during Docker build, so the image is reproducible from this source tree.
 
 ## Fast overlay build
@@ -94,6 +98,20 @@ done
 The `judgeXX.yml` files must already exist in the mounted problem directory and
 their IDs/keys must match the judges configured in the web database.
 
+Recommended judge config shape:
+
+```yaml
+id: judge05
+key: <judge-key-from-web>
+problem_storage_globs:
+  - /problems/*
+compiler_time_limit: 30
+```
+
+Keep `compiler_time_limit` at 30 seconds for this GCC 15 image. Lower values
+can produce random CE verdicts on ordinary C++20/C++23 submissions during
+rejudge bursts.
+
 ## Problem data sync
 
 Remote judge machines need the same problem data as the web VPS. One simple
@@ -107,7 +125,7 @@ For ongoing sync, install a cron job on the web VPS. This keeps new or edited
 problems available to remote judges after the next sync interval:
 
 ```cron
-*/5 * * * * root flock -n /var/lock/problem-sync-vps2.lock rsync -az --delete -e "ssh -i /root/.ssh/vps2_judge_sync -o StrictHostKeyChecking=no" /root/site/problems/ root@<judge-vps-ip>:/root/problems/ >> /root/problem-rsync-cron.log 2>&1
+*/5 * * * * root flock -n /var/lock/problem-sync-vps2.lock rsync -az --delete --timeout=30 -e "ssh -i /root/.ssh/vps2_judge_sync -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1" /root/site/problems/ root@<judge-vps-ip>:/root/problems/ >> /root/problem-rsync-cron.log 2>&1
 ```
 
 If the judge VPS was powered off while problems were added, wait for this sync

@@ -12,6 +12,6 @@ ENV PATH="/opt/kotlin/bin:/opt/pypy2/bin:/opt/pypy3/bin:/home/judge/.cargo/bin:$
 RUN mkdir /judge /problems
 COPY . /judge
 
-RUN set -ex; cd /judge; python3 -m venv --prompt=DMOJ /env; /env/bin/pip3 install cython setuptools; /env/bin/pip3 install -e .; /env/bin/python3 setup.py develop; HOME=~judge . ~judge/.profile; runuser -u judge -w PATH -- /env/bin/dmoj-autoconf -V > /judge-runtime-paths.yml; echo '  crt_x86_in_lib32: true' >> /judge-runtime-paths.yml; grep -q 'g++23:' /judge-runtime-paths.yml; mkdir -p /usr/lib/fpc/; cp /judge/asset/Windows.pas /usr/lib/fpc/; fpc -Fe/dev/stderr -O2 /usr/lib/fpc/Windows.pas; /judge/.docker/download_testlib_and_precompile
+RUN set -ex; cd /judge; python3 -m venv --prompt=DMOJ /env; /env/bin/pip3 install cython setuptools; /env/bin/pip3 install -e .; /env/bin/python3 setup.py develop; HOME=~judge . ~judge/.profile; runuser -u judge -w PATH -- /env/bin/dmoj-autoconf -V > /judge-runtime-paths.yml; echo '  crt_x86_in_lib32: true' >> /judge-runtime-paths.yml; printf '\ncompiler_time_limit: 30\n' >> /judge-runtime-paths.yml; grep -q 'g++23:' /judge-runtime-paths.yml; mkdir -p /usr/lib/fpc/; cp /judge/asset/Windows.pas /usr/lib/fpc/; fpc -Fe/dev/stderr -O2 /usr/lib/fpc/Windows.pas; /judge/.docker/download_testlib_and_precompile
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/judge/.docker/entry"]
