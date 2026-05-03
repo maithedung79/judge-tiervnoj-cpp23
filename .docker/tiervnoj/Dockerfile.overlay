@@ -1,5 +1,7 @@
 FROM vnoj/judge-tiervnoj:latest
 
+COPY .docker/download_testlib_and_precompile /judge/.docker/download_testlib_and_precompile
+COPY dmoj/judgeenv.py /judge/dmoj/judgeenv.py
 COPY dmoj/judge.py /judge/dmoj/judge.py
 COPY dmoj/packet.py /judge/dmoj/packet.py
 COPY dmoj/utils/helper_files.py /judge/dmoj/utils/helper_files.py
